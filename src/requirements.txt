@@ -1,0 +1,10 @@
+matplotlib
+imageio
+scikit-image
+opencv-python
+
+regex
+filelock
+sacremoses
+dataclasses
+tokenizers
