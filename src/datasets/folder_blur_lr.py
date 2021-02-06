@@ -3,9 +3,7 @@ from .vision import VisionDataset
 from PIL import Image
 from .imresize import imresize
 
-import io
 import imageio
-import cv2
 import os
 import os.path
 import sys
@@ -201,14 +199,11 @@ def accimage_loader(path):
 def imageio_loader(path):
     try:
         img = imageio.imread(path)
-        if len(img.shape) == 2:
-            img = np.stack((img,) * 3, axis=-1)
-        img = img[:, :, :3]
     except Exception as e:
         print('*' * 150)
         print(path)
         print('*' * 150)
-        raise(RuntimeError("Failed to load file: " + path))
+        raise
     return img
 
 def default_loader(path):
@@ -307,11 +302,11 @@ class NoiseDataset(VisionDataset):
 
 class HRDatasetFolder(VisionDataset):
     def __init__(self, root, scale, patch_size=0, transform=None, 
-        loader=imageio_loader, image_extension='.png', is_valid_file=None, is_same_size=False, lr_root=None, noise_root=None, noise_ratio=0.5, quality_range=None, blur_types=None):
+        loader=imageio_loader, image_extension='.png', is_valid_file=None, is_same_size=False, lr_root=None, noise_root=None, noise_ratio=0.5):
         super(HRDatasetFolder, self).__init__(root, transform=transform)
         samples = make_dataset_hr(self.root, image_extension, is_valid_file)
         #if patch_size > 0:
-        #    samples = 512 * samples
+        #    samples = 128 * samples
         if len(samples) == 0:
             raise (RuntimeError("Found 0 files in subfolders of: " + self.root))
 
@@ -327,50 +322,14 @@ class HRDatasetFolder(VisionDataset):
         self.is_same_size = is_same_size
         self.noise_root = noise_root
         self.noise_ratio = noise_ratio
-        if self.noise_root and self.noise_ratio >= 0:
+        if self.noise_root and self.noise_ratio > 0:
             noise_size = patch_size
             if not is_same_size:
                 noise_size = patch_size // self.scale
             self.noise_dataset = NoiseDataset(noise_root, loader, size=noise_size, transform=self.transform)
             self.noise_dataset_len = len(self.noise_dataset)
 
-        if quality_range:
-            self.quality_range = [int(v) for v in quality_range.split(':')]
-        else:
-            self.quality_range = None
-        if blur_types:
-            self.blur_types = []
-            types = blur_types.strip().split(',')
-            for bt in types:
-                d = bt.split(':')
-                self.blur_types += [d[0]] * int(d[1])
-            self.blur_types += ['null'] * (100 - len(self.blur_types))
-
-        else:
-            self.blur_types = ['null'] * 100
-
-    def compress_img(self, img):
-        if self.quality_range and random.randint(0, 100) > self.quality_range[2]:
-            buf = io.BytesIO()
-            quality = random.randint(self.quality_range[0], self.quality_range[1])
-            imageio.imwrite(buf, img, format='JPEG', quality=quality)
-            img = imageio.imread(buf.getvalue())
-        return img
-
-    def blur_img(self, img):
-        blur_type = self.blur_types[random.randint(0, 99)]
-        if blur_type == 'Average':
-            img = cv2.blur(img, (3, 3))
-        elif blur_type == 'Bilateral':
-            img = cv2.bilateralFilter(img, 9, 75, 75)
-        elif blur_type == 'Box':
-            img = cv2.boxFilter(img, -1, (3, 3))
-        elif blur_type == 'Gaussian':
-            img = cv2.GaussianBlur(img, (3, 3), 0)
-        elif blur_type == 'Median':
-            img = cv2.medianBlur(img, 3)
-        return img
-
+        # add noise dataset
 
     def __getitem__(self, index):
         path = self.samples[index]
@@ -392,11 +351,20 @@ class HRDatasetFolder(VisionDataset):
         if self.lr_root:
             lr_path = os.path.join(self.lr_root, fname) 
             lr = self.loader(lr_path)
+            rescale_h, rescale_w = lr.shape[:2]
+            blur_rescale_h = rescale_h // 2
+            blur_rescale_w = rescale_w // 2
+            lr = imresize(hr, output_shape=(blur_rescale_h, blur_rescale_w)) 
+            lr = imresize(lr, output_shape=(rescale_h, rescale_w)) 
         else:
-            lr = imresize(hr, output_shape=(rescale_h, rescale_w)) 
-
-        lr = self.compress_img(lr)
-        lr = self.blur_img(lr)
+            #lr = imresize(hr, output_shape=(rescale_h, rescale_w)) 
+            #if self.patch_size > 0: 
+            blur_rescale_h = rescale_h // 2
+            blur_rescale_w = rescale_w // 2
+            lr = imresize(hr, output_shape=(blur_rescale_h, blur_rescale_w)) 
+            lr = imresize(lr, output_shape=(rescale_h, rescale_w)) 
+            #else:
+            #    lr = imresize(hr, output_shape=(rescale_h, rescale_w))
 
         if self.is_same_size:
             lr = imresize(lr, output_shape=(rescale_h * self.scale, rescale_w * self.scale))

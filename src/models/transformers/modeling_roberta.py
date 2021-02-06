@@ -30,6 +30,7 @@ from torch.nn import CrossEntropyLoss, MSELoss
 from .configuration_roberta import RobertaConfig
 from .file_utils import add_start_docstrings, add_start_docstrings_to_callable
 from .modeling_bert import BertEmbeddings, BertLayerNorm, BertModel, BertPreTrainedModel, gelu
+from .modeling_bert import AxialPositionEmbeddings
 from .modeling_utils import create_position_ids_from_input_ids
 
 
@@ -46,82 +47,6 @@ ROBERTA_PRETRAINED_MODEL_ARCHIVE_LIST = [
 ]
 
 
-class AxialPositionEmbeddings(nn.Module):
-    """Constructs axial position embeddings. Useful for very long input
-    sequences to save memory and time.
-    """
-
-    def __init__(self, config):
-        super().__init__()
-        self.axial_pos_shape = tuple(config.axial_pos_shape)
-        self.axial_pos_embds_dim = tuple(config.axial_pos_embds_dim)
-        self.dropout = config.hidden_dropout_prob
-
-        #self.least_common_mult_chunk_length = _get_least_common_mult_chunk_len(config)
-        self.weights = nn.ParameterList()
-
-        assert (
-            sum(self.axial_pos_embds_dim) == config.hidden_size
-        ), "Make sure that config.axial_pos_embds factors: {} sum to config.hidden_size: {}".format(
-            self.axial_pos_embds_dim, config.hidden_size
-        )
-
-        # create weights
-        for axis, axial_pos_embd_dim in enumerate(self.axial_pos_embds_dim):
-            # create expanded shapes
-            ax_shape = [1] * len(self.axial_pos_shape)
-            ax_shape[axis] = self.axial_pos_shape[axis]
-            ax_shape = tuple(ax_shape) + (axial_pos_embd_dim,)
-
-            # create tensor and init
-            self.weights.append(nn.Parameter(torch.ones(ax_shape, dtype=torch.float32)))
-
-
-    def forward(self, position_ids):
-        # broadcast weights to correct shape
-        batch_size = position_ids.shape[0]
-        sequence_length = position_ids.shape[1]
-
-        #print(type(self.axial_pos_shape))
-        broadcasted_weights = [weight.expand((batch_size,) + self.axial_pos_shape + weight.shape[-1:]) for weight in self.weights]
-
-        #if self.training is True:
-        assert (reduce(mul, self.axial_pos_shape) == sequence_length), "If training, make sure that config.axial_pos_shape factors: {} multiply to sequence length. Got prod({}) != sequence_length: {}. You might want to consider padding your sequence length to {} or changing config.axial_pos_shape.".format(
-            self.axial_pos_shape, self.axial_pos_shape, sequence_length, reduce(mul, self.axial_pos_shape)
-        )
-        if self.dropout > 0:
-            weights = torch.cat(broadcasted_weights, dim=-1)
-            # permute weights so that 2D correctly drops dims 1 and 2
-            transposed_weights = weights.transpose(2, 1)
-            # drop entire matrix of last two dims (prev dims 1 and 2)
-            dropped_transposed_weights = nn.functional.dropout2d(
-                transposed_weights, p=self.dropout, training=self.training
-            )
-            dropped_weights = dropped_transposed_weights.transpose(2, 1)
-
-            position_encodings = torch.reshape(dropped_weights, (batch_size, sequence_length, -1))
-
-        else:
-            position_encodings = torch.cat([torch.reshape(weight, (batch_size, sequence_length, -1)) for weight in broadcasted_weights], dim=-1,)
-
-        '''
-        else:
-            assert (
-                reduce(mul, self.axial_pos_shape) >= sequence_length
-            ), "Make sure that config.axial_pos_shape factors: {} multiply at least to max(sequence_length, least_common_mult_chunk_length): max({}, {})".format(
-                self.axial_pos_shape, sequence_length, self.least_common_mult_chunk_length,
-            )
-
-            # reshape axial encodings and use only until sequence_length
-            position_encodings = torch.cat(broadcasted_weights, dim=-1)
-            position_encodings = position_encodings.view(batch_size, -1, position_encodings.shape[-1])[
-                :, :sequence_length
-            ]
-        '''
-        return position_encodings
-
-
-
 class RobertaEmbeddings(BertEmbeddings):
     """
     Same as BertEmbeddings with a tiny tweak for positional embeddings indexing.
@@ -129,14 +54,21 @@ class RobertaEmbeddings(BertEmbeddings):
 
     def __init__(self, config):
         super().__init__(config)
+        self.config = config
         self.padding_idx = config.pad_token_id
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
+        if self.config.rgb:
+            self.r_word_embeddings = nn.Embedding(config.vocab_size, config.rgb_embds_dim[0], padding_idx=self.padding_idx)
+            self.g_word_embeddings = nn.Embedding(config.vocab_size, config.rgb_embds_dim[1], padding_idx=self.padding_idx)
+            self.b_word_embeddings = nn.Embedding(config.vocab_size, config.rgb_embds_dim[2], padding_idx=self.padding_idx)
+        else:
+            self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=self.padding_idx)
+
         #self.position_embeddings = nn.Embedding(
         #    config.max_position_embeddings, config.hidden_size, padding_idx=self.padding_idx
         #)
-        self.position_embeddings = (
-            AxialPositionEmbeddings(config) if config.axial_pos_embds else PositionEmbeddings(config)
-        )
+        self.position_embeddings = AxialPositionEmbeddings(config) if config.axial_pos_embds else nn.Embedding(
+                config.max_position_embeddings, config.hidden_size, padding_idx=self.padding_idx
+            )
 
     def forward(self, input_ids=None, token_type_ids=None, position_ids=None, inputs_embeds=None):
         '''
@@ -152,7 +84,7 @@ class RobertaEmbeddings(BertEmbeddings):
         )
         '''
         if input_ids is not None:
-            input_shape = input_ids.size()
+            input_shape = input_ids[:, :, 0].size()
         else:
             input_shape = inputs_embeds.size()[:-1]
 
@@ -161,15 +93,32 @@ class RobertaEmbeddings(BertEmbeddings):
         if position_ids is None:
             position_ids = torch.arange(seq_length, dtype=torch.long, device=device)
             position_ids = position_ids.unsqueeze(0).expand(input_shape)
-        if token_type_ids is None:
-            token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+        #if token_type_ids is None:
+        token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
 
         if inputs_embeds is None:
-            inputs_embeds = self.word_embeddings(input_ids)
+            if self.config.rgb:
+                #print(input_ids)
+                #print(input_ids.shape)
+                r_inputs_embeds = self.r_word_embeddings(input_ids[:, :, 0])
+                g_inputs_embeds = self.g_word_embeddings(input_ids[:, :, 1])
+                b_inputs_embeds = self.b_word_embeddings(input_ids[:, :, 2])
+                #print('r_inputs_embeds', r_inputs_embeds.shape)
+                #print('g_inputs_embeds', g_inputs_embeds.shape)
+                #print('b_inputs_embeds', b_inputs_embeds.shape)
+                inputs_embeds = torch.cat((r_inputs_embeds, g_inputs_embeds, b_inputs_embeds), dim=-1)
+                #print(inputs_embeds)
+                #print(inputs_embeds.shape)
+            else:
+                inputs_embeds = self.word_embeddings(input_ids)
         position_embeddings = self.position_embeddings(position_ids)
         token_type_embeddings = self.token_type_embeddings(token_type_ids)
 
+        #print('inputs_embeds', inputs_embeds.shape)
+        #print('position_embeddings', position_embeddings.shape)
+        #print('token_type_embeddings', token_type_embeddings.shape)
         embeddings = inputs_embeds + position_embeddings + token_type_embeddings
+        #print('embeddings', embeddings.shape)
         embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings

@@ -1087,6 +1087,8 @@ class LongformerForTokenClassification(BertPreTrainedModel):
         sequence_output = outputs[0]
 
         sequence_output = self.dropout(sequence_output)
+        b, l, h = sequence_output.shape
+        #logits = self.classifier(sequence_output.reshape(b, l, 3, -1))
         logits = self.classifier(sequence_output)
         return logits
         '''

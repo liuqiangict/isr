@@ -229,3 +229,8 @@ if is_torch_available:
         LONGFORMER_PRETRAINED_MODEL_ARCHIVE_LIST,
     )
 
+    from .modeling_sparse import (
+        SparseModel,
+        SparseForTokenClassification,
+    )
+

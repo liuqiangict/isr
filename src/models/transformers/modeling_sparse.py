@@ -14,62 +14,12 @@ from .file_utils import add_start_docstrings, add_start_docstrings_to_callable
 from .modeling_bert import BertEmbeddings, BertSelfAttention, BertIntermediate, BertLayerNorm, BertPooler, BertModel, BertPreTrainedModel, gelu
 from .modeling_bert import AxialPositionEmbeddings
 from .modeling_utils import create_position_ids_from_input_ids
-
-from deepspeed.ops.sparse_attention import DenseSparsityConfig
-from deepspeed.ops.sparse_attention import FixedSparsityConfig
-from deepspeed.ops.sparse_attention import BigBirdSparsityConfig
-from deepspeed.ops.sparse_attention import BSLongformerSparsityConfig
-from deepspeed.ops.sparse_attention import VariableSparsityConfig
-from deepspeed.ops.sparse_attention import SparseSelfAttention as DeepSpeedSparseSelfAttention 
-
+#from torch_blocksparse import DeepSpeedSparseSelfAttention, SparsityConfig
 
 def swish(x):
     return x * torch.sigmoid(x)
 
 ACT2FN = {"gelu": gelu, "relu": torch.nn.functional.relu, "swish": swish}
-
-def get_sparse_attention_config(config):
-    if (config.mode == 'dense'):
-        return DenseSparsityConfig(num_heads=config.num_attention_heads, 
-                                        block=config.block,
-                                        different_layout_per_head=config.different_layout_per_head)
-    elif (config.mode == 'fixed'):
-        return FixedSparsityConfig(num_heads=config.num_attention_heads,
-                                        block=config.block,
-                                        different_layout_per_head=config.different_layout_per_head,
-                                        num_local_blocks=config.num_local_blocks,
-                                        num_global_blocks=config.num_global_blocks,
-                                        attention=config.attention,
-                                        horizontal_global_attention=config.different_layout_per_head,
-                                        num_different_global_patterns=config.num_different_global_patterns)
-    elif (config.mode == 'bigbird'):
-        return BigBirdSparsityConfig(num_heads=config.num_attention_heads,
-                                        block=config.block,
-                                        different_layout_per_head=config.different_layout_per_head,
-                                        num_random_blocks=config.num_random_blocks,
-                                        num_sliding_window_blocks=config.num_sliding_window_blocks,
-                                        num_global_blocks=config.num_global_blocks)
-    elif (config.mode == 'bslongformer'):
-        return BSLongformerSparsityConfig(num_heads=config.num_attention_heads,
-                                        block=config.block,
-                                        different_layout_per_head=config.different_layout_per_head,
-                                        num_sliding_window_blocks=config.num_sliding_window_blocks)#,
-                                        #global_block_indices=config.global_block_indices,
-                                        #global_block_end_indices=config.global_block_end_indices)
-    elif (config.mode == 'variable'):
-        return VariableSparsityConfig(num_heads=config.num_attention_heads,
-                                        block=config.block,
-                                        different_layout_per_head=config.different_layout_per_head,
-                                        num_random_blocks=config.num_random_blocks,
-                                        local_window_blocks=config.local_window_blocks,
-                                        global_block_indices=config.global_block_indices,
-                                        global_block_end_indices=config.global_block_end_indices,
-                                        attention=config.attention,
-                                        horizontal_global_attention=config.horizontal_global_attention)
-    else:
-        raise NotImplementedError(f'Given sparsity mode, {config.mode}, has not been implemented yet!')
-    return None
-
 
 class SparseEmbeddings(BertEmbeddings):
     """
@@ -109,31 +59,32 @@ class SparseEmbeddings(BertEmbeddings):
         return embeddings
 
 
-class SparseSelfAttention(nn.Module):
-    def __init__(self, config, sparsity_config):
-        super(SparseSelfAttention, self).__init__()
-        if config.hidden_size % config.num_attention_heads != 0:
-            raise ValueError(
-                "The hidden size (%d) is not a multiple of the number of attention "
-                "heads (%d)" % (config.hidden_size,
-                                config.num_attention_heads))
-        self.num_attention_heads = config.num_attention_heads
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
-        self.all_head_size = self.num_attention_heads * self.attention_head_size
+class SparseSelfAttention(BertSelfAttention):
+    def __init__(self, config):
+        super(SparseSelfAttention, self).__init__(config)
 
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        self.output_attentions = False #config.output_attentions
+        self.sparse = True
+        self.sparse_self_attention = DeepSpeedSparseSelfAttention(
+                SparsityConfig(config.mode, config.block, config.stride, config.unidirectional, config.numverts, config.vertsize)
+            ).cuda()
 
-        self.sparse_self_attention = DeepSpeedSparseSelfAttention(sparsity_config)
+    def transpose_mask_for_sparse(self, x, btsz):
+        unsqz = False if x.shape[0] > 1 else True
+        x = torch.squeeze(x)
+        if unsqz:
+            x = torch.unsqueeze(x, 0)
+            x = x.repeat(btsz, 1)
+        return x
 
-    def transpose_for_scores(self, x):
-        new_x_shape = x.size()[:-1] + (self.num_attention_heads,
-                                       self.attention_head_size)
-        x = x.view(*new_x_shape)
-        return x.permute(0, 2, 1, 3)
-
-    def forward(self, hidden_states, attention_mask):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+    ):
         mixed_query_layer = self.query(hidden_states)
         mixed_key_layer = self.key(hidden_states)
         mixed_value_layer = self.value(hidden_states)
@@ -142,15 +93,24 @@ class SparseSelfAttention(nn.Module):
         key_layer = self.transpose_for_scores(mixed_key_layer)
         value_layer = self.transpose_for_scores(mixed_value_layer)
 
-        context_layer = self.sparse_self_attention(query_layer,
-                                                   key_layer,
-                                                   value_layer,
-                                                   key_padding_mask=attention_mask)
+        attention_mask = self.transpose_mask_for_sparse(attention_mask, hidden_states.shape[0])
+        attention_mask = attention_mask.to(query_layer.dtype)
+
+        context_layer = self.sparse_self_attention(
+            query_layer,
+            key_layer,
+            value_layer,
+            key_padding_mask=attention_mask
+        )
 
         context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size, )
+        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
         context_layer = context_layer.view(*new_context_layer_shape)
-        return context_layer
+
+        outputs = ( (context_layer,))
+
+        return outputs
+
 
 class SparseSelfOutput(nn.Module):
     def __init__(self, config):
@@ -169,10 +129,7 @@ class SparseSelfOutput(nn.Module):
 class SparseAttention(nn.Module):
     def __init__(self, config):
         super(SparseAttention, self).__init__()
-
-        sparse_attention_config = get_sparse_attention_config(config)
-        self.self = SparseSelfAttention(config, sparsity_config=sparse_attention_config)
-
+        self.self = SparseSelfAttention(config)
         self.output = SparseSelfOutput(config)
         self.pruned_heads = set()
 
@@ -184,12 +141,12 @@ class SparseAttention(nn.Module):
         encoder_hidden_states=None,
         encoder_attention_mask=None,
     ):
-        self_output = self.self(
-            hidden_states, attention_mask
+        self_outputs = self.self(
+            hidden_states, attention_mask, head_mask, encoder_hidden_states, encoder_attention_mask
         )
-        attention_output = self.output(self_output, hidden_states)
-
-        return (attention_output,)
+        attention_output = self.output(self_outputs[0], hidden_states)
+        outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
+        return outputs
 
 
 class SparseIntermediate(nn.Module):

@@ -2,9 +2,8 @@ matplotlib
 imageio
 scikit-image
 opencv-python
-
+lpips
 regex
 filelock
 sacremoses
 dataclasses
-tokenizers

@@ -5,6 +5,7 @@ import math
 import numpy
 import cv2
 import imageio
+import lpips
 
 import torch
 
@@ -96,8 +97,20 @@ def calc_ssim(img1, img2):
     else:
         raise ValueError('Wrong input image dimensions.')
 
+def calc_lpips(loss_fn, img1, img2):
+    factor = 255. / 2.
+    cent = 1.
+    img1 = img1 / factor - cent
+    img2 = img2 / factor - cent
+
+    # Compute distance
+    with torch.no_grad():
+        dist = loss_fn.forward(img1, img2).squeeze().unsqueeze(dim=0)
+    return dist
+
 def save_results(data, output_folder, filename, scale):
-    filename = os.path.join(output_folder, '{}_x{}'.format(filename[0], scale))
+    #filename = os.path.join(output_folder, '{}_x{}'.format(filename[0], scale))
+    filename = os.path.join(output_folder, filename[0])
     b, c, h, w = data.shape
     img = data.reshape(c, h, w).round().clamp_(0., 255.).byte().permute(1, 2, 0).cpu().numpy()
     imageio.imsave('{}.png'.format(filename), img)

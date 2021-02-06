@@ -23,15 +23,10 @@
   "type_vocab_size": 1,
   "use_bfloat16": false,
   "vocab_size": 256,
-  "mode": "bslongformer",
+  "mode": "fixed",
   "block": 16,
   "stride": 64,
   "unidirectional": "bidirectional",
   "numverts": 4,
-  "vertsize": 1,
-  "block": 64,
-  "different_layout_per_head": false,
-  "num_random_blocks": 48,
-  "num_sliding_window_blocks": 118,
-  "num_global_blocks": 0
+  "vertsize": 1
 }
